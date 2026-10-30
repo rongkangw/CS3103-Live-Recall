@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""
-CS3103 Assignment 4 - LiveRecall naive working baseline.
+"""CS3103 Assignment 4 - LiveRecall server implementation.
 
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
+The server receives caption updates from the instructor's caption source,
+maintains the latest state for each segment, and broadcasts to student clients.
 
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
+Key features:
+- Validates protocol messages from source and clients
+- Tracks authoritative state (provisional + finalized captions)
+- Filters recovery history based on client resume state
+- Broadcasts captions to connected clients
 
 Required evaluator command:
     python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
 """
 
 from __future__ import annotations
@@ -30,94 +23,138 @@ from typing import Any
 
 import websockets
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+from protocol import (
+    ClientHello,
+    ProtocolError,
+    RevisionDecision,
+    SourceHello,
+    parse_caption_update,
+    parse_hello,
+)
+from server_state import SessionState
+
+# Track which session each client subscribed to
+CLIENTS: dict[Any, str] = {}
+
+SESSION_STATES: dict[str, SessionState] = {}
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
+def get_session_state(session: str) -> SessionState:
+    """Get or create state for a session (e.g., 'L1' for lecture 1)."""
+    state = SESSION_STATES.get(session)
+    if state is None:
+        state = SessionState(session)
+        SESSION_STATES[session] = state
+    return state
 
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
+
+async def broadcast(raw_message: str, session: str) -> None:
+    """Send one message directly to every client in a session.
+
+    The source handler currently waits for all sends to complete. 
+    TODO: Per-client queues and backpressure have not been implemented yet.
     """
     if not CLIENTS:
         return
 
-    snapshot = list(CLIENTS)
+    # Filter clients to only those in the target session
+    snapshot = [
+        client
+        for client, client_session in CLIENTS.items()
+        if client_session == session
+    ]
     results = await asyncio.gather(
         *(client.send(raw_message) for client in snapshot),
         return_exceptions=True,
     )
     for client, result in zip(snapshot, results):
         if isinstance(result, Exception):
-            CLIENTS.discard(client)
+            CLIENTS.pop(client, None)
 
 
-async def handle_source(ws, hello: dict[str, Any]) -> None:
-    session = hello.get("session")
+async def handle_source(ws, hello: SourceHello) -> None:
+    """Reads CAPTION_UPDATE messages, validates, updates state, and broadcasts. Ignores any malformed messages.
+    """
+    session = hello.session
+    state = get_session_state(session)
     print(f"source connected: session={session}", flush=True)
 
     try:
         async for raw in ws:
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
+                message = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                 continue
 
-            msg_type = msg.get("type")
+            if not isinstance(message, dict):
+                continue
+            msg_type = message.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                try:
+                    update = parse_caption_update(raw)
+                except ProtocolError:
+                    continue
+                if update.session != session:
+                    continue
+                decision = state.accept(update)
+                if decision is not RevisionDecision.ACCEPT:
+                    continue
+                await broadcast(
+                    json.dumps(update.to_message()),
+                    session,
+                )
             elif msg_type == "SOURCE_DONE":
-                # Test-control message. The specification does not require it
-                # to be forwarded to clients.
                 print("source finished", flush=True)
             else:
-                # Forward compatibility: ignore fields/messages this baseline
-                # doesn't understand rather than crashing.
                 continue
     finally:
         print("source disconnected", flush=True)
 
 
-async def handle_client(ws, hello: dict[str, Any]) -> None:
-    client_id = hello.get("client_id")
+async def handle_client(ws, hello: ClientHello) -> None:
+    """Sends filtered recovery history based on client's resume state, then registers client for live updates.
+    """
+    client_id = hello.client_id
+    session = hello.session
+    state = get_session_state(session)
 
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
+    # Get only captions the client hasn't seen yet
+    history_items = state.filtered_finals(
+        hello.history_seconds,
+        hello.last_segment,
+        hello.last_revision,
+    )
 
-    CLIENTS.add(ws)
+    # Send filtered history BEFORE registering for live updates
+    # This prevents race where an update falls between history and live
+    await ws.send(
+        json.dumps({"type": "HISTORY", "items": [u.to_message() for u in history_items]})
+    )
+
+    CLIENTS[ws] = session
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
+        # Keep the connection open until the client disconnects
         async for _ in ws:
             pass
     finally:
-        CLIENTS.discard(ws)
+        CLIENTS.pop(ws, None)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 
 async def handler(ws) -> None:
+    """Parse hello and route to source or client handler."""
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
-        hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+        hello = parse_hello(raw)
+    except (asyncio.TimeoutError, ProtocolError):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
-    msg_type = hello.get("type")
-    if msg_type == "SOURCE_HELLO":
+    if isinstance(hello, SourceHello):
         await handle_source(ws, hello)
-    elif msg_type == "CLIENT_HELLO":
+    elif isinstance(hello, ClientHello):
         await handle_client(ws, hello)
-    else:
-        await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
 async def main_async(port: int) -> None:
@@ -129,7 +166,7 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+        print(f"LiveRecall server listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
 
 

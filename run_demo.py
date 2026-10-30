@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import socket
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from websockets.sync.client import connect as websocket_connect
 
 from analyse_results import analyse_file, print_summary
 
@@ -33,16 +34,36 @@ def terminate_process(proc, name):
 
 
 def wait_for_port(port, proc, timeout=10.0):
+    """Wait until the server completes a real WebSocket protocol exchange."""
     deadline = time.time() + timeout
+    last_error = None
     while time.time() < deadline:
         if proc.poll() is not None:
             raise RuntimeError("solution_server.py exited before becoming ready")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            with websocket_connect(
+                f"ws://127.0.0.1:{port}",
+                open_timeout=0.5,
+                close_timeout=0.5,
+            ) as ws:
+                ws.send(json.dumps({
+                    "type": "CLIENT_HELLO",
+                    "client_id": "readiness-probe",
+                    "session": "L1",
+                    "last_segment": 0,
+                    "last_revision": 0,
+                    "history_seconds": 0,
+                }))
+                response = json.loads(ws.recv(timeout=1.0))
+                if response.get("type") != "HISTORY":
+                    raise RuntimeError("readiness probe expected HISTORY")
                 return
-        except OSError:
+        except Exception as exc:
+            last_error = exc
             time.sleep(0.15)
-    raise RuntimeError("server did not listen within 10 seconds")
+    raise RuntimeError(
+        f"server did not complete a WebSocket handshake within 10 seconds: {last_error}"
+    )
 
 
 def default_source_segments(duration, source_start_delay):
