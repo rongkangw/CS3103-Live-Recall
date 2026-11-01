@@ -40,6 +40,9 @@ CLIENTS: dict[Any, ClientState] = {}
 
 SESSION_STATES: dict[str, SessionState] = {}
 
+# After 4 messages, wait until the client confirms it has read them
+SEND_WINDOW = 4
+
 
 def get_session_state(session: str) -> SessionState:
     """Get or create state for a session (e.g., 'L1' for lecture 1)."""
@@ -102,27 +105,46 @@ async def handle_source(ws, hello: SourceHello) -> None:
 async def client_sender(client: ClientState) -> None:
     """Independent sender that waits until this client has a pending caption.
 
-    While a send is blocked by backpressure, newer provisionals overwrite older
-    ones in the buffer, so coalescing happens only when the client actually lags.
+    Every SEND_WINDOW messages it pings and waits for the pong, which only comes
+    back after the client has read everything sent so far. While it waits, newer
+    provisionals overwrite older ones in the buffer, so coalescing happens only
+    when the client actually lags at its side.
     """
     ws = client.websocket
-    while True:
-        await client.wakeup.wait()
+    # number of messages sent since the previous pong ie client's ack
+    unconfirmed = 0
+    try:
+        while True:
+            await client.wakeup.wait()
 
-        if client.overflowed:
-            await ws.close(code=1013, reason="client too slow; reconnect to resume")
-            return
-        
-        raw = client.next_pending()
+            if client.overflowed:
+                await ws.close(code=1013, reason="client too slow; reconnect to resume")
+                return
+            
+            raw = client.next_pending()
 
-        if raw is None:
-            client.wakeup.clear()
-            continue
+            if raw is None:
+                client.wakeup.clear()
+                continue
 
-        try:
+            
             await ws.send(raw)
-        except ConnectionClosed:
-            return
+            unconfirmed += 1
+
+            if unconfirmed >= SEND_WINDOW:
+                #pending response to the ping
+                pong = asyncio.ensure_future(
+                    await ws.ping()
+                    )
+
+                while not pong.done() and not client.overflowed:
+                    await asyncio.wait({pong}, timeout=0.1)
+                if pong.done():
+                    pong.result()
+
+                unconfirmed = 0
+    except ConnectionClosed:
+        return
 
 
 async def handle_client(ws, hello: ClientHello) -> None:
