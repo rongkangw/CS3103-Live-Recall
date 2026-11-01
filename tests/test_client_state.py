@@ -4,7 +4,9 @@ import unittest
 
 from protocol import CaptionUpdate
 from server_state import ClientState
+from unittest import mock
 
+import server_state
 
 def update(segment=1, revision=1, *, final=False):
     return CaptionUpdate(
@@ -68,6 +70,18 @@ class ClientStateTests(unittest.TestCase):
 
     def test_empty_buffer_returns_none(self):
         self.assertIsNone(self.client.next_pending())
+
+    def test_finals_backlog_over_cap_marks_overflow_and_frees_memory(self):
+        with mock.patch.object(server_state, "DEFAULT_MAX_PENDING_FINALS", 5):
+            for segment in range(1, 7):
+                push(self.client, segment, 1, final=True)
+        self.assertTrue(self.client.overflowed)
+        self.assertEqual(drain(self.client), [])
+
+    def test_enqueue_is_ignored_after_overflow(self):
+        self.client.overflowed = True
+        push(self.client, 1, 1, final=True)
+        self.assertEqual(drain(self.client), [])
 
 
 if __name__ == "__main__":

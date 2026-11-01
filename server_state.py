@@ -29,6 +29,9 @@ DEFAULT_HISTORY_RETENTION_SECONDS = 90.0
 # Max number of finalized captions to keep
 DEFAULT_MAX_FINALIZED_CAPTIONS = 4096
 
+# Max finals queued for one client before it is disconnected.
+DEFAULT_MAX_PENDING_FINALS = 64
+
 
 @dataclass(frozen=True, slots=True)
 class FinalizedRecord:
@@ -48,11 +51,22 @@ class ClientState:
     wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     sender_task: asyncio.Task | None = None
 
+    # Set when finals backlog exceeds max. client closed.
+    overflowed: bool = False
+
 
     def enqueue(self, update: CaptionUpdate, raw: str) -> None:
+        if self.overflowed:
+            return
+        
         if update.final:
             self.pending_provisional.pop(update.segment, None)
             self.pending_finals.append(raw)
+            if len(self.pending_finals) > DEFAULT_MAX_PENDING_FINALS:
+                #Too far behind, drop
+                self.overflowed = True
+                self.pending_finals.clear()
+                self.pending_provisional.clear()
             
         else:
             # Coalesce: overwrite an unsent older revision of this segment

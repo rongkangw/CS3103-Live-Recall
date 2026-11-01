@@ -108,6 +108,10 @@ async def client_sender(client: ClientState) -> None:
     ws = client.websocket
     while True:
         await client.wakeup.wait()
+
+        if client.overflowed:
+            await ws.close(code=1013, reason="client too slow; reconnect to resume")
+            return
         
         raw = client.next_pending()
 
