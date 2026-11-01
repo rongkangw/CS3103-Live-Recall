@@ -32,6 +32,9 @@ DEFAULT_MAX_FINALIZED_CAPTIONS = 4096
 # Max finals queued for one client before it is disconnected.
 DEFAULT_MAX_PENDING_FINALS = 64
 
+# In lag mode, send a provisional only after this long with nothing sent
+LAG_PROVISIONAL_IDLE_SECONDS = 2.0
+
 
 @dataclass(frozen=True, slots=True)
 class FinalizedRecord:
@@ -54,6 +57,10 @@ class ClientState:
     # Set when finals backlog exceeds max. client closed.
     overflowed: bool = False
 
+    #timer for lag mode
+    lag_until: float = 0.0
+    last_send_at: float = 0.0
+
 
     def enqueue(self, update: CaptionUpdate, raw: str) -> None:
         if self.overflowed:
@@ -73,11 +80,19 @@ class ClientState:
             self.pending_provisional[update.segment] = raw
         self.wakeup.set()
 
-    def next_pending(self) -> str | None:
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending_finals or self.pending_provisional)
+
+    """send provisional if not in lag mode or nothing sent in 2 seconds"""
+    def may_send_provisional(self, now: float) -> bool:
+        return now >= self.lag_until or now - self.last_send_at >= LAG_PROVISIONAL_IDLE_SECONDS
+
+    def next_pending(self, allow_provisional: bool = True) -> str | None:
         # Finals first (oldest to newest), then provisionals by lowest segment
         if self.pending_finals:
             return self.pending_finals.popleft()
-        if self.pending_provisional:
+        if self.pending_provisional and allow_provisional:
             return self.pending_provisional.pop(min(self.pending_provisional))
         return None
 

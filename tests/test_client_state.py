@@ -83,6 +83,28 @@ class ClientStateTests(unittest.TestCase):
         push(self.client, 1, 1, final=True)
         self.assertEqual(drain(self.client), [])
 
+    def test_provisional_allowed_when_not_lagging(self):
+        self.assertTrue(self.client.may_send_provisional(now=100.0))
+
+    def test_lag_mode_holds_provisionals_until_idle(self):
+        self.client.lag_until = 115.0
+        self.client.last_send_at = 100.0
+        self.assertFalse(self.client.may_send_provisional(now=101.0))
+        self.assertTrue(self.client.may_send_provisional(now=102.0))
+
+    def test_lag_mode_ends_after_hold(self):
+        self.client.lag_until = 115.0
+        self.client.last_send_at = 114.9
+        self.assertTrue(self.client.may_send_provisional(now=115.0))
+
+    def test_held_back_provisional_does_not_block_finals(self):
+        push(self.client, 1, 3, final=True)
+        push(self.client, 2, 1)
+        self.assertEqual(self.client.next_pending(allow_provisional=False), "1.3F")
+        self.assertIsNone(self.client.next_pending(allow_provisional=False))
+        self.assertTrue(self.client.has_pending)
+        self.assertEqual(self.client.next_pending(), "2.1")
+
 
 if __name__ == "__main__":
     unittest.main()

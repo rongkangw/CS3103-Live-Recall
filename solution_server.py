@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from typing import Any
 
 import websockets
@@ -42,6 +43,12 @@ SESSION_STATES: dict[str, SessionState] = {}
 
 # After 4 messages, wait until the client confirms it has read them
 SEND_WINDOW = 4
+
+# A pong slower than this means the client is lagging
+LAG_PONG_SECONDS = 0.5
+
+# How long a lagging client stays in lag mode after its last slow pong
+LAG_HOLD_SECONDS = 15.0
 
 
 def get_session_state(session: str) -> SessionState:
@@ -120,18 +127,27 @@ async def client_sender(client: ClientState) -> None:
             if client.overflowed:
                 await ws.close(code=1013, reason="client too slow; reconnect to resume")
                 return
-            
-            raw = client.next_pending()
 
+            now = time.monotonic()
+            
+            raw = client.next_pending(allow_provisional=client.may_send_provisional(now))
+
+            # No update can be sent now
             if raw is None:
-                client.wakeup.clear()
+                # But still got provisional in buffer, then wait a while
+                if client.has_pending:
+                    await asyncio.sleep(0.05)
+                else:
+                    client.wakeup.clear()
                 continue
 
             
             await ws.send(raw)
+            client.last_send_at = now
             unconfirmed += 1
 
             if unconfirmed >= SEND_WINDOW:
+                started = time.monotonic()
                 #pending response to the ping
                 pong = asyncio.ensure_future(
                     await ws.ping()
@@ -141,6 +157,8 @@ async def client_sender(client: ClientState) -> None:
                     await asyncio.wait({pong}, timeout=0.1)
                 if pong.done():
                     pong.result()
+                if time.monotonic() - started > LAG_PONG_SECONDS:
+                    client.lag_until = time.monotonic() + LAG_HOLD_SECONDS
 
                 unconfirmed = 0
     except ConnectionClosed:
