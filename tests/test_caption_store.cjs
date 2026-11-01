@@ -83,3 +83,65 @@ test("malformed messages are ignored and caller mutations cannot alter stored st
   assert.equal(store.getResumeState().last_segment, 1);
   assert.throws(() => store.getRecall(61), RangeError);
 });
+
+test("recall orders recovered finals by source timestamp, with a stable segment tie-break", () => {
+  const store = makeStore();
+  store.mergeHistory([
+    caption({ segment: 1, source_ts: 999, final: true }),
+    caption({ segment: 4, source_ts: 980, final: true }),
+    caption({ segment: 3, source_ts: 980, final: true }),
+    caption({ segment: 2, source_ts: 950, final: true }),
+  ]);
+  assert.deepEqual(store.getRecall(60).map((c) => c.segment), [2, 3, 4, 1]);
+  assert.deepEqual(store.getRecall(30).map((c) => c.segment), [3, 4, 1]);
+  assert.deepEqual(store.getRecall(15).map((c) => c.segment), [1]);
+  store.dispose();
+});
+
+test("idle pruning retains the exact 60-second boundary and preserves resume state", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 1000;
+  const store = new CaptionStore({ clock: () => now });
+  t.after(() => store.dispose());
+  store.applyUpdate(caption({ final: true }));
+  now = 1060;
+  t.mock.timers.tick(1000);
+  assert.equal(store._captions.size, 1);
+  now = 1060.001;
+  t.mock.timers.tick(1000);
+  // Inspect storage directly: a read must not be what triggers pruning here.
+  assert.equal(store._captions.size, 0);
+  assert.deepEqual(store.getResumeState(), { last_segment: 1, last_revision: 1 });
+  assert.equal(store.mergeHistory([caption({ final: true })]), 0);
+});
+
+test("a long-running lecture retains only the rolling window", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 1000;
+  const store = new CaptionStore({ clock: () => now });
+  t.after(() => store.dispose());
+  for (let segment = 1; segment <= 600; segment += 1) {
+    now += 1;
+    store.applyUpdate(caption({ segment, source_ts: now, final: true }));
+    t.mock.timers.tick(1000);
+  }
+  assert.equal(store._captions.size, 61);
+  assert.equal(store.getRecall(60).length, 61);
+  assert.equal(store.getRecall(30).length, 31);
+  assert.equal(store.getRecall(15).length, 16);
+  assert.equal(store.getResumeState().last_segment, 600);
+});
+
+test("disposing the store stops background pruning", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 1000;
+  const store = new CaptionStore({ clock: () => now });
+  store.applyUpdate(caption({ final: true }));
+  store.dispose();
+  store.dispose();
+  now = 1100;
+  t.mock.timers.tick(1000);
+  assert.equal(store._captions.size, 1);
+  // Reads still enforce the history window after the timer is stopped.
+  assert.deepEqual(store.getRecall(60), []);
+});

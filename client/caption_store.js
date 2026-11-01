@@ -13,6 +13,15 @@ class CaptionStore {
     this.clock = clock;
     this._captions = new Map();
     this._resume = new Map();
+    // Expire captions even while disconnected or when the UI is idle.
+    this._pruneTimer = setInterval(() => this._prune(this.clock()), 1000);
+    // A store must not keep a Node test/application process alive by itself.
+    this._pruneTimer.unref?.();
+  }
+
+  /** Release the periodic timer when this store is no longer in use. */
+  dispose() {
+    clearInterval(this._pruneTimer);
   }
 
   _prune(now) {
@@ -89,9 +98,11 @@ class CaptionStore {
       throw new RangeError("seconds must be between 0 and historySeconds");
     }
     const now = this.clock();
-    return this.getLiveCaptions(session).filter((caption) =>
-      seconds > 0 && caption.final &&
-      caption.source_ts >= now - seconds && caption.source_ts <= now);
+    this._prune(now);
+    return Array.from(this._captions.values())
+      .filter((caption) => caption.session === session && seconds > 0 && caption.final &&
+        caption.source_ts >= now - seconds && caption.source_ts <= now)
+      .sort((a, b) => a.source_ts - b.source_ts || a.segment - b.segment);
   }
 
   /** CLIENT_HELLO fields: provisional updates never advance this cursor. */
