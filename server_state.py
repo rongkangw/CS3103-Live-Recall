@@ -9,10 +9,11 @@ Finalized captions: immutable, kept for recovery
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Callable
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from protocol import (
     CaptionUpdate,
@@ -33,6 +34,38 @@ DEFAULT_MAX_FINALIZED_CAPTIONS = 4096
 class FinalizedRecord:
     update: CaptionUpdate
     accepted_at: float
+
+@dataclass(slots=True)
+class ClientState:
+    """Per client record that server maintains each client's caption delivery independently.
+    """
+    client_id: int | str
+    session: str
+    websocket: Any
+    pending_finals: deque = field(default_factory=deque)
+    pending_provisional: dict = field(default_factory=dict)
+    
+    wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    sender_task: asyncio.Task | None = None
+
+
+    def enqueue(self, update: CaptionUpdate, raw: str) -> None:
+        if update.final:
+            self.pending_provisional.pop(update.segment, None)
+            self.pending_finals.append(raw)
+            
+        else:
+            # Coalesce: overwrite an unsent older revision of this segment
+            self.pending_provisional[update.segment] = raw
+        self.wakeup.set()
+
+    def next_pending(self) -> str | None:
+        # Finals first (oldest to newest), then provisionals by lowest segment
+        if self.pending_finals:
+            return self.pending_finals.popleft()
+        if self.pending_provisional:
+            return self.pending_provisional.pop(min(self.pending_provisional))
+        return None
 
 class SessionState:
     """Track the latest accepted state for every segment in one session.
