@@ -3,28 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LiveRecall Student Client</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
-    #status { font-weight: 700; }
-    #live { min-height: 6rem; border: 1px solid #bbb; border-radius: .4rem; padding: 1rem; margin: 1rem 0; }
-    .naive-line { padding: .25rem 0; border-bottom: 1px dotted #ddd; }
-    button { padding: .55rem .75rem; margin: .2rem; }
-    #recall { white-space: pre-wrap; margin-top: 1rem; border-left: 3px solid #ccc; padding-left: 1rem; }
-    .hint { font-size: .9rem; color: #555; }
-  </style>
+  <title>LiveRecall · Lecture captions</title>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <h1>LiveRecall</h1>
-  <p>Connection: <span id="status">disconnected</span></p>
-  <p class="hint">Starter behavior is intentionally naive: every received revision is appended as a new line.</p>
-  <div id="live"></div>
-  <div>
-    <button data-seconds="30">What did I miss? (30 s)</button>
-    <button data-seconds="15">15 s</button>
-    <button data-seconds="60">60 s</button>
-  </div>
-  <div id="recall">TODO: implement the locally maintained recall view.</div>
+  <header class="topbar">
+    <div class="brand"><svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><path d="M5 5v12h8M11 9h10v12H11M15 13h3M15 17h3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>LiveRecall</span></div>
+    <span class="session">Lecture L1</span>
+    <span id="status" role="status" data-state="disconnected">disconnected</span>
+  </header>
+  <main>
+    <div class="page-heading">
+      <div><h1>Lecture captions</h1><p></p></div>
+      <button id="open-recall" class="primary" type="button" aria-controls="recall-panel">What did I miss? <span aria-hidden="true">↗</span></button>
+    </div>
+    <div class="reading-grid">
+      <section class="panel" aria-labelledby="live-heading">
+        <div class="panel-heading"><h2 id="live-heading">Live captions</h2><span>As it’s spoken</span></div>
+        <p class="panel-description">Words update as the lecturer speaks. Final captions are complete.</p>
+        <ol id="live" class="caption-list" aria-label="Live lecture captions" aria-live="polite" aria-relevant="additions text"></ol>
+        <p id="live-empty" class="empty-state">Waiting for the lecturer’s captions. They’ll appear here when the lecture starts.</p>
+      </section>
+      <section id="recall-panel" class="panel recall-panel" aria-labelledby="recall-heading">
+        <div class="panel-heading"><h2 id="recall-heading" tabindex="-1">What did I miss?</h2><span id="recall-window">Last 30 seconds</span></div>
+        <div class="recall-toolbar">
+          <div class="window-controls" role="group" aria-label="Recall time window">
+            <button type="button" data-seconds="15" aria-pressed="false" aria-controls="recall">15 s</button>
+            <button type="button" data-seconds="30" aria-pressed="true" aria-controls="recall">30 s</button>
+            <button type="button" data-seconds="60" aria-pressed="false" aria-controls="recall">60 s</button>
+          </div>
+          <span class="local-label">Recent final captions</span>
+        </div>
+        <ol id="recall" class="caption-list" aria-label="Recalled finalised captions"></ol>
+        <p id="recall-empty" class="empty-state">No finalised captions in the last 30 seconds. Completed captions will appear here.</p>
+      </section>
+    </div>
+    <noscript><p>Enable JavaScript to receive live captions and use recall.</p></noscript>
+  </main>
+  <script src="caption_store.js"></script>
+  <script src="ui.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
