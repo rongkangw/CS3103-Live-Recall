@@ -19,11 +19,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from protocol import (
+    CaptionUpdate,
     ClientHello,
     ProtocolError,
     RevisionDecision,
@@ -31,12 +34,21 @@ from protocol import (
     parse_caption_update,
     parse_hello,
 )
-from server_state import SessionState
+from server_state import ClientState, SessionState
 
-# Track which session each client subscribed to
-CLIENTS: dict[Any, str] = {}
+# Track which session each client subsribed to. Also stores state of client
+CLIENTS: dict[Any, ClientState] = {}
 
 SESSION_STATES: dict[str, SessionState] = {}
+
+# After 4 messages, wait until the client confirms it has read them
+SEND_WINDOW = 4
+
+# A pong slower than this means the client is lagging
+LAG_PONG_SECONDS = 0.5
+
+# How long a lagging client stays in lag mode after its last slow pong
+LAG_HOLD_SECONDS = 15.0
 
 
 def get_session_state(session: str) -> SessionState:
@@ -48,28 +60,18 @@ def get_session_state(session: str) -> SessionState:
     return state
 
 
-async def broadcast(raw_message: str, session: str) -> None:
-    """Send one message directly to every client in a session.
+def broadcast(update: CaptionUpdate, session: str) -> None:
+    """Only enqueues one update into every client's buffer in a session.
 
-    The source handler currently waits for all sends to complete. 
-    TODO: Per-client queues and backpressure have not been implemented yet.
+    Does not sent nor wait for client.
     """
     if not CLIENTS:
         return
 
-    # Filter clients to only those in the target session
-    snapshot = [
-        client
-        for client, client_session in CLIENTS.items()
-        if client_session == session
-    ]
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.pop(client, None)
+    raw_message = json.dumps(update.to_message())
+    for client_state in CLIENTS.values():
+        if client_state.session == session:
+            client_state.enqueue(update, raw_message)
 
 
 async def handle_source(ws, hello: SourceHello) -> None:
@@ -99,16 +101,68 @@ async def handle_source(ws, hello: SourceHello) -> None:
                 decision = state.accept(update)
                 if decision is not RevisionDecision.ACCEPT:
                     continue
-                await broadcast(
-                    json.dumps(update.to_message()),
-                    session,
-                )
+                broadcast(update, session)
             elif msg_type == "SOURCE_DONE":
                 print("source finished", flush=True)
             else:
                 continue
     finally:
         print("source disconnected", flush=True)
+
+async def client_sender(client: ClientState) -> None:
+    """Independent sender that waits until this client has a pending caption.
+
+    Every SEND_WINDOW messages it pings and waits for the pong, which only comes
+    back after the client has read everything sent so far. While it waits, newer
+    provisionals overwrite older ones in the buffer, so coalescing happens only
+    when the client actually lags at its side.
+    """
+    ws = client.websocket
+    # number of messages sent since the previous pong ie client's ack
+    unconfirmed = 0
+    try:
+        while True:
+            await client.wakeup.wait()
+
+            if client.overflowed:
+                await ws.close(code=1013, reason="client too slow; reconnect to resume")
+                return
+
+            now = time.monotonic()
+            
+            raw = client.next_pending(allow_provisional=client.may_send_provisional(now))
+
+            # No update can be sent now
+            if raw is None:
+                # But still got provisional in buffer, then wait a while
+                if client.has_pending:
+                    await asyncio.sleep(0.05)
+                else:
+                    client.wakeup.clear()
+                continue
+
+            
+            await ws.send(raw)
+            client.last_send_at = now
+            unconfirmed += 1
+
+            if unconfirmed >= SEND_WINDOW:
+                started = time.monotonic()
+                #pending response to the ping
+                pong = asyncio.ensure_future(
+                    await ws.ping()
+                    )
+
+                while not pong.done() and not client.overflowed:
+                    await asyncio.wait({pong}, timeout=0.1)
+                if pong.done():
+                    pong.result()
+                if time.monotonic() - started > LAG_PONG_SECONDS:
+                    client.lag_until = time.monotonic() + LAG_HOLD_SECONDS
+
+                unconfirmed = 0
+    except ConnectionClosed:
+        return
 
 
 async def handle_client(ws, hello: ClientHello) -> None:
@@ -118,6 +172,12 @@ async def handle_client(ws, hello: ClientHello) -> None:
     session = hello.session
     state = get_session_state(session)
 
+    client_state = ClientState(
+        client_id,
+        session,
+        ws,
+    )
+
     # Get only captions the client hasn't seen yet
     history_items = state.filtered_finals(
         hello.history_seconds,
@@ -125,21 +185,41 @@ async def handle_client(ws, hello: ClientHello) -> None:
         hello.last_revision,
     )
 
-    # Send filtered history BEFORE registering for live updates
-    # This prevents race where an update falls between history and live
-    await ws.send(
-        json.dumps({"type": "HISTORY", "items": [u.to_message() for u in history_items]})
-    )
+    for update in state.active_snapshot():
+        client_state.enqueue(update, json.dumps(update.to_message()))
 
-    CLIENTS[ws] = session
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    CLIENTS[ws] = client_state
+
     try:
+        await ws.send(
+            json.dumps({
+                "type": "HISTORY",
+                "items": [u.to_message() for u in history_items]
+                })
+        )
+        client_state.sender_task = asyncio.create_task(
+            client_sender(client_state)
+            )
+        print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+
         # Keep the connection open until the client disconnects
         async for _ in ws:
             pass
     finally:
         CLIENTS.pop(ws, None)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+
+        if client_state.sender_task is not None:
+            client_state.sender_task.cancel()
+            try:
+                await client_state.sender_task
+            except asyncio.CancelledError:
+                pass
+
+        print(
+            f"client disconnected: id={client_id}; "
+            f"clients={len(CLIENTS)}",
+            flush=True
+        )
 
 
 async def handler(ws) -> None:

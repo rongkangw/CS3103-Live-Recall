@@ -9,10 +9,11 @@ Finalized captions: immutable, kept for recovery
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Callable
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from protocol import (
     CaptionUpdate,
@@ -28,11 +29,72 @@ DEFAULT_HISTORY_RETENTION_SECONDS = 90.0
 # Max number of finalized captions to keep
 DEFAULT_MAX_FINALIZED_CAPTIONS = 4096
 
+# Max finals queued for one client before it is disconnected.
+DEFAULT_MAX_PENDING_FINALS = 64
+
+# In lag mode, send a provisional only after this long with nothing sent
+LAG_PROVISIONAL_IDLE_SECONDS = 2.0
+
 
 @dataclass(frozen=True, slots=True)
 class FinalizedRecord:
     update: CaptionUpdate
     accepted_at: float
+
+@dataclass(slots=True)
+class ClientState:
+    """Per client record that server maintains each client's caption delivery independently.
+    """
+    client_id: int | str
+    session: str
+    websocket: Any
+    pending_finals: deque = field(default_factory=deque)
+    pending_provisional: dict = field(default_factory=dict)
+    
+    wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    sender_task: asyncio.Task | None = None
+
+    # Set when finals backlog exceeds max. client closed.
+    overflowed: bool = False
+
+    #timer for lag mode
+    lag_until: float = 0.0
+    last_send_at: float = 0.0
+
+
+    def enqueue(self, update: CaptionUpdate, raw: str) -> None:
+        if self.overflowed:
+            return
+        
+        if update.final:
+            self.pending_provisional.pop(update.segment, None)
+            self.pending_finals.append(raw)
+            if len(self.pending_finals) > DEFAULT_MAX_PENDING_FINALS:
+                #Too far behind, drop
+                self.overflowed = True
+                self.pending_finals.clear()
+                self.pending_provisional.clear()
+            
+        else:
+            # Coalesce: overwrite an unsent older revision of this segment
+            self.pending_provisional[update.segment] = raw
+        self.wakeup.set()
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending_finals or self.pending_provisional)
+
+    """send provisional if not in lag mode or nothing sent in 2 seconds"""
+    def may_send_provisional(self, now: float) -> bool:
+        return now >= self.lag_until or now - self.last_send_at >= LAG_PROVISIONAL_IDLE_SECONDS
+
+    def next_pending(self, allow_provisional: bool = True) -> str | None:
+        # Finals first (oldest to newest), then provisionals by lowest segment
+        if self.pending_finals:
+            return self.pending_finals.popleft()
+        if self.pending_provisional and allow_provisional:
+            return self.pending_provisional.pop(min(self.pending_provisional))
+        return None
 
 class SessionState:
     """Track the latest accepted state for every segment in one session.
