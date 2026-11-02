@@ -14,11 +14,28 @@ class CaptionUI {
     this.onWindowClick = (event) => this.selectRecall(Number(event.currentTarget.dataset.seconds));
     for (const button of this.buttons) button.addEventListener("click", this.onWindowClick);
     this.openButton = root.getElementById("open-recall");
+    this.closeButton = root.getElementById("close-recall");
+    this.recallPanel = root.getElementById("recall-panel");
     this.onOpen = () => {
+      this.recallPanel.hidden = false;
+      this.openButton.setAttribute("aria-expanded", "true");
       this.selectRecall(30);
       root.getElementById("recall-heading").focus();
     };
+    this.onClose = () => {
+      this.recallPanel.hidden = true;
+      this.openButton.setAttribute("aria-expanded", "false");
+      this.openButton.focus();
+    };
+    this.onRecallKeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.onClose();
+      }
+    };
     this.openButton.addEventListener("click", this.onOpen);
+    this.closeButton.addEventListener("click", this.onClose);
+    this.recallPanel.addEventListener("keydown", this.onRecallKeydown);
     this.render();
     // Keep recall and empty states current even during silence or disconnection.
     this.timer = setInterval(() => this.render(), 1000);
@@ -48,7 +65,8 @@ class CaptionUI {
         state.className = "caption-state";
         const text = document.createElement("p");
         text.className = "caption-text";
-        meta.append(time, state);
+        meta.append(time);
+        if (container === this.live) meta.append(state);
         row.append(meta, text);
         rows.set(key, row);
       }
@@ -59,7 +77,8 @@ class CaptionUI {
         const time = row.querySelector("time");
         time.dateTime = new Date(caption.source_ts * 1000).toISOString();
         time.textContent = this.timeFormat.format(caption.source_ts * 1000);
-        row.querySelector(".caption-state").textContent = caption.final ? "Final" : "Provisional";
+        const state = row.querySelector(".caption-state");
+        if (state) state.textContent = caption.final ? "Final" : "Provisional";
         // Incoming text must never be interpreted as HTML.
         row.querySelector(".caption-text").textContent = caption.text;
         row._caption = caption;
@@ -96,5 +115,7 @@ class CaptionUI {
     clearInterval(this.timer);
     for (const button of this.buttons) button.removeEventListener("click", this.onWindowClick);
     this.openButton.removeEventListener("click", this.onOpen);
+    this.closeButton.removeEventListener("click", this.onClose);
+    this.recallPanel.removeEventListener("keydown", this.onRecallKeydown);
   }
 }
