@@ -50,3 +50,8 @@ python run_demo.py --clients 20 --duration 20 --runs 3
 ```
 
 Keep the generated results for the baseline comparison. See `PUBLIC_TESTS.md` for the full test suite.
+
+
+## Demo video
+
+[Youtube video link](https://youtu.be/g9EL0BJNFk8)
