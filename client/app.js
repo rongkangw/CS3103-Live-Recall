@@ -1,56 +1,54 @@
-/* Socket integration. CaptionStore owns state; CaptionUI owns rendering. */
 
 const WS_URL = "ws://127.0.0.1:8765";
-const store = new CaptionStore({ session: "L1" });
-const ui = new CaptionUI(store);
 
-let ws;
+const statusEl = document.getElementById("status");
+
+const store = new CaptionStore({
+  session: "L1",
+  historySeconds: 60
+});
+
+const ui = new CaptionUI(store);
 
 function numericClientId() {
   const key = "liverecall-client-id";
-  let value = sessionStorage.getItem(key);
-  if (!value) {
-    value = String(Math.floor(100000 + Math.random() * 900000));
-    sessionStorage.setItem(key, value);
+
+  let value = localStorage.getItem(key);
+
+  if (value === null) {
+    value = String(Math.floor(Math.random() * 1000000) + 1);
+    localStorage.setItem(key, value);
   }
+
   return Number(value);
 }
 
-function connect() {
-  ui.setConnectionStatus("connecting");
-  ws = new WebSocket(WS_URL);
+const connection = new ConnectionManager(WS_URL, {
+  getClientId: numericClientId,
 
-  ws.addEventListener("open", () => {
-    ui.setConnectionStatus("connected");
-    ws.send(JSON.stringify({
-      type: "CLIENT_HELLO",
-      client_id: numericClientId(),
-      session: "L1",
-      ...store.getResumeState(),
-      history_seconds: 30
-    }));
-  });
+  getResumeState: () => store.getResumeState(),
 
-  ws.addEventListener("message", (event) => {
-    let msg;
-    try { msg = JSON.parse(event.data); } catch { return; }
-    if (!msg || typeof msg !== "object") return;
-    if (msg.type === "CAPTION_UPDATE") {
-      if (store.applyUpdate(msg)) ui.render();
-    } else if (msg.type === "HISTORY") {
-      store.mergeHistory(msg.items);
+  onHistory: (items) => {
+    store.mergeHistory(items);
+    ui.render();
+  },
+
+  onCaption: (message) => {
+    if (store.applyUpdate(message)) {
       ui.render();
     }
-  });
+  },
 
-  ws.addEventListener("close", () => {
-    ui.setConnectionStatus("disconnected");
-    // TODO: automatic reconnect after a short delay, using finalized resume state. (Part D)
-  });
+  onStatusChange: (status) => {
+    statusEl.textContent = status;
+    ui.setConnectionStatus(status);
+  }
+});
 
-  ws.addEventListener("error", () => {
-    ui.setConnectionStatus("connection error");
-  });
-}
+connection.connect();
 
-connect();
+window.addEventListener("beforeunload", () => {
+  connection.disconnect();
+  ui.dispose();
+  store.dispose();
+});
