@@ -1,12 +1,9 @@
-# Team XX - LiveRecall
+# Team 19 - LiveRecall
 
 LiveRecall is a classroom caption companion for CS3103 Assignment 4. A caption
 source sends provisional and final revisions to a WebSocket server. The server
 validates and distributes them independently to many clients, while the browser
 replaces revisions in place and provides local 15/30/60-second recall.
-
-> Before submission, replace `XX` and each student-ID placeholder below with the
-> team's official details.
 
 ## Team members
 
@@ -108,7 +105,7 @@ python run_demo.py --clients 100 --duration 40 --runs 3 --output-stem t5
 sudo ./network_profiles/reset.sh lo
 ```
 
-## Mandatory deterministic application demo
+## Demo
 
 From the repository root, use three terminals.
 
